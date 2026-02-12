@@ -9,10 +9,28 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <atomic>
+#include <vector>
 
 using json = nlohmann::json;
 
-// ---------- helper ----------
+// =======================================================
+// ---------------- SYSTEM STATE --------------------------
+// =======================================================
+
+enum class SystemState {
+    RUNNING,
+    HALTED
+};
+
+std::atomic<SystemState> system_state(SystemState::RUNNING);
+std::atomic<int> target_index(-1);
+std::atomic<bool> ui_busy(false);
+
+// =======================================================
+// ---------------- HELPERS --------------------------------
+// =======================================================
+
 int parse_int(const char* txt) {
     if (!txt) return -1;
     std::string s(txt);
@@ -23,7 +41,32 @@ int parse_int(const char* txt) {
     return std::stoi(s);
 }
 
-// ---------- full screen capture ----------
+// ---------------- Mouse Click (FAST) --------------------
+
+void mouse_click(int x, int y, int screenW, int screenH) {
+    INPUT input{};
+
+    input.type = INPUT_MOUSE;
+    input.mi.dx = x * 65535 / screenW;
+    input.mi.dy = y * 65535 / screenH;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    SendInput(1, &input, sizeof(INPUT));
+
+    ZeroMemory(&input, sizeof(INPUT));
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    SendInput(1, &input, sizeof(INPUT));
+
+    ZeroMemory(&input, sizeof(INPUT));
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+// =======================================================
+// ---------------- SCREEN CAPTURE ------------------------
+// =======================================================
+
 cv::Mat capture_screen() {
     HWND hwnd = GetDesktopWindow();
     HDC hdcScreen = GetDC(hwnd);
@@ -55,12 +98,16 @@ cv::Mat capture_screen() {
     return img;
 }
 
+// =======================================================
+// ---------------- MAIN ----------------------------------
+// =======================================================
+
 int main() {
     SetProcessDPIAware();
 
     std::cout << "SCAN STARTED\n";
 
-    // ---------- load calibration ----------
+    // ---------- Load calibration ----------
     json cfg;
     std::ifstream f("calibration.json");
     if (!f) {
@@ -72,6 +119,17 @@ int main() {
     int x1 = cfg["x1"];
     int x2 = cfg["x2"];
     auto offers = cfg["offers"];
+    auto buy_buttons = cfg["buy_buttons"];
+
+    POINT tab_default{
+        cfg["tabs"]["default"]["x"],
+        cfg["tabs"]["default"]["y"]
+    };
+
+    POINT tab_large{
+        cfg["tabs"]["large"]["x"],
+        cfg["tabs"]["large"]["y"]
+    };
 
     int topY = INT_MAX, bottomY = 0;
     for (auto& o : offers) {
@@ -80,9 +138,8 @@ int main() {
     }
 
     int stripW = x2 - x1;
-    int stripH = bottomY - topY;
 
-    // ---------- init tesseract ----------
+    // ---------- Init Tesseract ----------
     tesseract::TessBaseAPI tess;
     tess.Init("./tessdata", "eng", tesseract::OEM_LSTM_ONLY);
     tess.SetPageSegMode(tesseract::PSM_SINGLE_LINE);
@@ -92,49 +149,143 @@ int main() {
 
     std::cout << "TESSERACT INITIALIZED\n\n";
 
-    // ---------- scan loop ----------
-    while (true) {
-        auto start = std::chrono::high_resolution_clock::now();
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-        // 1️⃣ Full screen capture (GPU-safe)
-        cv::Mat screen = capture_screen();
+    // ===================================================
+    // ---------------- VISION THREAD --------------------
+    // ===================================================
 
-        // 2️⃣ Crop vertical strip (cheap)
-        cv::Mat strip = screen(
-            cv::Range(topY, bottomY),
-            cv::Range(x1, x2)
-        );
+    std::thread vision([&]() {
+        while (system_state == SystemState::RUNNING) {
 
-        std::cout << "Offers: ";
+            if (GetAsyncKeyState(VK_F12) & 1) system_state = SystemState::HALTED;
 
-        // 3️⃣ Crop 7 offers
-        for (int i = 0; i < 7; i++) {
-            int y1 = offers[i]["y1"].get<int>() - topY;
-            int y2 = offers[i]["y2"].get<int>() - topY;
+            if (ui_busy) {
+                Sleep(1);
+                continue;
+            }
 
-            cv::Mat roi = strip(
-                cv::Range(y1, y2),
-                cv::Range(0, stripW)
+            auto start = std::chrono::high_resolution_clock::now();
+
+            cv::Mat screen = capture_screen();
+            cv::Mat strip = screen(
+                cv::Range(topY, bottomY),
+                cv::Range(x1, x2)
             );
 
-            cv::Mat gray;
-            cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
-            cv::convertScaleAbs(gray, gray, 1.3, 0);
+            static cv::Mat last;
+            if (!last.empty()) {
+                cv::Mat diff;
+                cv::absdiff(strip, last, diff);
+                if (cv::mean(diff)[0] > 15) {
+                    last = strip.clone();
+                    continue;
+                }
+            }
+            last = strip.clone();
 
-            tess.SetImage(gray.data, gray.cols, gray.rows, 1, gray.step);
-            char* txt = tess.GetUTF8Text();
-            int val = parse_int(txt);
-            delete[] txt;
+            static int log_counter = 0;
+            bool do_log = (++log_counter % 10 == 0);
 
-            if (val >= 0) std::cout << val << " ";
-            else std::cout << "-- ";
+            if (do_log) std::cout << "Offers: ";
+
+            for (int i = 0; i < 7; i++) {
+                int y1 = offers[i]["y1"].get<int>() - topY;
+                int y2 = offers[i]["y2"].get<int>() - topY;
+
+                cv::Mat roi = strip(
+                    cv::Range(y1, y2),
+                    cv::Range(0, stripW)
+                );
+
+                cv::Mat gray;
+                cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+                cv::convertScaleAbs(gray, gray, 1.3, 0);
+
+                if (cv::mean(gray)[0] > 245 || cv::mean(gray)[0] < 10) {
+                     std::cout << "-- ";
+                     continue;
+                }
+
+                tess.SetImage(gray.data, gray.cols, gray.rows, 1, gray.step);
+                char* txt = tess.GetUTF8Text();
+                int val = parse_int(txt);
+                delete[] txt;
+
+                if (val >= 0) {
+                    if (do_log) std::cout << val << " ";
+                    if (val == 1000) {
+                        target_index = i;
+                        std::cout << "[TARGET] ";
+                        return; // STOP vision immediately
+                    }
+                } else {
+                    if (do_log) std::cout << "-- ";
+                }
+            }
+
+            auto end = std::chrono::high_resolution_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            if (do_log) std::cout << "| Scan time: " << ms << " ms\n";
         }
+    });
 
-        auto end = std::chrono::high_resolution_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    // ===================================================
+    // ---------------- ACTION THREAD --------------------
+    // ===================================================
 
-        std::cout << "| Scan time: " << ms << " ms\n";
+    std::thread action([&]() {
+        while (system_state == SystemState::RUNNING) {
+            if (GetAsyncKeyState(VK_F12) & 1) system_state = SystemState::HALTED;
+            int idx = target_index.load();
+            if (idx >= 0) {
+                mouse_click(
+                    buy_buttons[idx]["x"],
+                    buy_buttons[idx]["y"],
+                    screenW,
+                    screenH
+                );
+                system_state = SystemState::HALTED;
+                return;
+            }
+            Sleep(1);
+        }
+    });
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    }
+    // ===================================================
+    // ---------------- TAB THREAD -----------------------
+    // ===================================================
+
+    std::thread tabs([&]() {
+        while (system_state == SystemState::RUNNING) {
+            if (GetAsyncKeyState(VK_F12) & 1) system_state = SystemState::HALTED;
+            ui_busy = true;
+            mouse_click(tab_default.x, tab_default.y, screenW, screenH);
+            Sleep(200);
+            ui_busy = false;
+
+            Sleep(800);
+
+            if (system_state != SystemState::RUNNING) return;
+
+            ui_busy = true;
+            mouse_click(tab_large.x, tab_large.y, screenW, screenH);
+            Sleep(200);
+            ui_busy = false;
+
+            Sleep(800);
+        }
+    });
+
+    // ===================================================
+    // ---------------- JOIN -----------------------------
+    // ===================================================
+
+    vision.join();
+    action.join();
+    tabs.join();
+
+    std::cout << "\nSYSTEM HALTED\n";
+    return 0;
 }
